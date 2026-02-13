@@ -4,6 +4,7 @@
 // @description  Export nominations data from Wayfarer to IITC via Google Sheets
 // @namespace    https://github.com/Editst/wayfarer/
 // @downloadURL  https://github.com/Editst/wayfarer/raw/main/wayfarer-exporter.user.js
+// @updateURL    https://github.com/Editst/wayfarer/raw/main/wayfarer-exporter.user.js
 // @match        https://opr.ingress.com/*
 // @grant        unsafeWindow
 // @grant        GM_setValue
