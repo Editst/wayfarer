@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Wayfarer Exporter Optimized
-// @version      0.9.0
+// @version      0.9.1
 // @description  Export nominations data from Wayfarer to IITC via Google Sheets
 // @namespace    https://github.com/Editst/wayfarer/
 // @downloadURL  https://github.com/Editst/wayfarer/raw/main/wayfarer-exporter.user.js
@@ -17,8 +17,8 @@
     'use strict';
 
     const CONFIG = {
-        MAX_CONCURRENT_UPLOADS: 5, // 降低并发数以提高稳定性
-        CACHE_DURATION: 12 * 60 * 60 * 1000, // 12小时缓存
+        MAX_CONCURRENT_UPLOADS: 3, // 限制并发数，防止 Google Script 报错
+        CACHE_DURATION: 12 * 60 * 60 * 1000, // 本地缓存有效期 12小时
         RETRY_LIMIT: 3
     };
 
@@ -30,7 +30,7 @@
             this.sentNominations = null; // 当前页面获取的列表
             this.profileName = null;
             this.logger = null;
-
+            
             this.init();
         }
 
@@ -63,7 +63,7 @@
         }
 
         /**
-         * 使用 MutationObserver 监听侧边栏加载，替代 setTimeout
+         * 使用 MutationObserver 监听侧边栏加载，替代 setTimeout 轮询
          */
         observeUI() {
             const observer = new MutationObserver((mutations, obs) => {
@@ -93,8 +93,8 @@
                     this.log('Error: Failed to parse nominations data.');
                     return;
                 }
-
-                // 稍作延迟以确保 UI 渲染完成（可选）
+                
+                // 稍作延迟以确保 UI 渲染完成
                 setTimeout(() => this.analyzeCandidates(), 500);
 
             } catch (e) {
@@ -125,11 +125,14 @@
             this.candidates = storedCandidates;
             this.log(`Analyzing ${this.sentNominations.length} nominations...`);
 
-            let modified = false;
+            // [Fix] 创建一个包含当前 API 所有 ID 的 Set，用于防止误删真实存在的近距离申请
+            const currentApiIds = new Set(this.sentNominations.map(n => n.id));
 
+            let modified = false;
+            
             // 遍历当前 API 返回的所有申请
             for (const nomination of this.sentNominations) {
-                if (await this.checkNomination(nomination)) {
+                if (await this.checkNomination(nomination, currentApiIds)) {
                     modified = true;
                 }
             }
@@ -147,17 +150,17 @@
          * 检查单个申请的状态变化
          * @returns {boolean} 是否发生了变化
          */
-        async checkNomination(nomination) {
+        async checkNomination(nomination, currentApiIds) {
             const id = nomination.id;
             const existing = this.candidates[id];
             const currentStatus = this.statusConvertor(nomination.status);
 
             // 1. 已存在的记录
             if (existing) {
-                // 如果已通过，不再追踪
+                // 如果已通过，不再追踪，发送删除指令给 Sheet
                 if (nomination.status === 'ACCEPTED') {
                     this.log(`Approved: ${nomination.title}`);
-                    this.queueUpdate(nomination, 'delete'); // 从 Sheet 中标记或移除
+                    this.queueUpdate(nomination, 'delete'); 
                     delete this.candidates[id];
                     return true;
                 }
@@ -178,7 +181,7 @@
                     this.log(`Info Updated: ${nomination.title}`);
                     return true;
                 }
-
+                
                 return false;
             }
 
@@ -186,13 +189,20 @@
             if (['NOMINATED', 'VOTING', 'HELD', 'APPEALED'].includes(nomination.status)) {
                 // S2 查重逻辑：检查是否已经在 IITC 中手动添加过
                 const cell17id = S2Helper.getCellId(nomination.lat, nomination.lng);
-
+                
                 Object.keys(this.candidates).forEach(idx => {
                     const candidate = this.candidates[idx];
-                    // 同一 S2 L17 格子且距离小于 20米，视为手动添加的记录，删除旧的记录
+                    
+                    // [Fix] 如果本地缓存的这个 candidate 其实也在当前的 API 列表中，
+                    // 说明它是另一个真实的申请，不是手动添加的占位符，跳过删除逻辑。
+                    if (currentApiIds.has(idx)) {
+                        return; 
+                    }
+
+                    // 同一 S2 L17 格子且距离小于 20米，且确认不是真实存在的其他申请，才视为手动条目进行替换
                     if (candidate.cell17id === cell17id && S2Helper.getDistance(candidate, nomination) < 20) {
                         this.log(`Found manual entry match for ${candidate.title}, replacing.`);
-                        this.queueUpdate({id: idx}, 'delete');
+                        this.queueUpdate({id: idx}, 'delete'); // 删除旧的手动条目
                         delete this.candidates[idx];
                     }
                 });
@@ -206,7 +216,7 @@
                     lng: nomination.lng,
                     status: currentStatus
                 };
-
+                
                 this.log(`New Candidate: ${nomination.title}`);
                 this.queueUpdate(nomination, currentStatus);
                 return true;
@@ -234,7 +244,7 @@
                     formData.append('candidateimageurl', nomination.imageUrl || '');
                     formData.append('nickname', nickname);
                 }
-
+                
                 this.queue.push(formData);
                 this.processQueue();
             });
@@ -271,6 +281,8 @@
                 formData.retries--;
                 if (formData.retries > 0) {
                     this.queue.push(formData); // 重新入队
+                } else {
+                    this.log(`Failed to sync: ${formData.get('title')}`);
                 }
             })
             .finally(() => {
@@ -336,7 +348,7 @@
                 localStorage['wayfarerexporter-url'] = url;
                 localStorage['wayfarerexporter-lastupdate'] = Date.now();
                 localStorage['wayfarerexporter-candidates'] = JSON.stringify(candidates);
-
+                
                 this.log(`Loaded ${Object.keys(candidates).length} active candidates.`);
                 return candidates;
 
@@ -357,14 +369,13 @@
          */
         async getProfileName() {
             if (this.profileName) return this.profileName;
-
+            
             const cached = localStorage.getItem('wayfarerexporter-nickname');
             if (cached) {
                 this.profileName = cached;
                 return cached;
             }
 
-            // 如果缓存没有，尝试 API 请求（通常会在 handleProfileLoad 中被拦截，这里作为兜底）
             try {
                 const res = await fetch('https://opr.ingress.com/api/v1/vault/properties');
                 const json = await res.json();
@@ -375,9 +386,8 @@
                 return 'wayfarer_user';
             }
         }
-
+        
         loadProfileName() {
-             // 仅触发一下读取，不阻塞
              this.getProfileName();
         }
 
@@ -411,6 +421,7 @@
                 <span> Exporter</span>
             `;
 
+            // 插入到 Nominations 链接之后
             referenceNode.parentNode.insertBefore(link, referenceNode.nextSibling);
 
             link.addEventListener('click', (e) => {
@@ -435,7 +446,7 @@
             this.msgLog.appendChild(line);
             this.msgLog.scrollTop = this.msgLog.scrollHeight;
         }
-
+        
         updateLogUI() {
              if(this.statusLog) {
                  const remaining = this.queue.length + this.activeUploads;
@@ -455,9 +466,9 @@
                 <div class="log-status" style="font-weight:bold;margin-bottom:5px;color:#007bff;"></div>
                 <div class="log-wrapper" style="max-height:200px;overflow-y:auto;font-size:12px;"></div>
             `;
-
+            
             document.body.appendChild(this.logger);
-
+            
             this.logger.querySelector('.close-btn').onclick = () => this.removeLogger();
             this.msgLog = this.logger.querySelector('.log-wrapper');
             this.statusLog = this.logger.querySelector('.log-status');
@@ -487,12 +498,10 @@
 
     /**
      * S2 Geometry Helper (Simplified for L17 Cell ID only)
-     * 提取出的纯逻辑工具类
+     * 纯净的 S2 计算逻辑，用于计算 Cell ID 和距离
      */
     const S2Helper = {
         getCellId: function(lat, lng, level = 17) {
-            // 这里为了保持代码精简，我保留了原有的核心算法，但去掉了未使用的部分
-            // 实际使用可以使用更精简的库，但为了不引入外部依赖，这里内联核心逻辑
             const d2r = Math.PI / 180.0;
             const xyz = (function() {
                 const phi = lat * d2r;
@@ -523,13 +532,13 @@
             let face = largestAbsComponent(xyz);
             if (xyz[face] < 0) face += 3;
             const uv = faceXYZToUV(face, xyz);
-
+            
             const STToIJ = function(st, order) {
                 const maxSize = 1 << order;
                 const val = Math.floor(st * maxSize);
                 return Math.max(0, Math.min(maxSize - 1, val));
             };
-
+            
             const UVToST = function(uv) {
                 if (uv >= 0) return 0.5 * Math.sqrt(1 + 3 * uv);
                 return 1 - 0.5 * Math.sqrt(1 - 3 * uv);
@@ -537,12 +546,12 @@
 
             const st = [UVToST(uv[0]), UVToST(uv[1])];
             const ij = [STToIJ(st[0], level), STToIJ(st[1], level)];
-
+            
             return `F${face}ij[${ij[0]},${ij[1]}]@${level}`;
         },
 
         getDistance: function(p1, p2) {
-            const R = 6378137; // Earth’s mean radius in meter
+            const R = 6378137; // 地球平均半径 (米)
             const dLat = (p2.lat - p1.lat) * Math.PI / 180;
             const dLong = (p2.lng - p1.lng) * Math.PI / 180;
             const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
